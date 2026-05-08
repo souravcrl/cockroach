@@ -14,6 +14,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/nstree"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
@@ -43,6 +45,15 @@ func (p *planner) DropProvisionedRoles(
 	if err := p.CheckGlobalPrivilegeOrRoleOption(ctx, privilege.CREATEROLE); err != nil {
 		return nil, err
 	}
+	// Validate that the LIMIT expression is a constant integer to
+	// prevent subqueries or other expressions from being smuggled
+	// into the internal query.
+	if n.Limit != nil && n.Limit.Count != nil {
+		if _, ok := n.Limit.Count.(*tree.NumVal); !ok {
+			return nil, pgerror.Newf(pgcode.InvalidParameterValue,
+				"LIMIT must be a constant integer expression")
+		}
+	}
 	return &DropProvisionedRolesNode{
 		options: n.Options,
 		limit:   n.Limit,
@@ -59,7 +70,10 @@ func (n *DropProvisionedRolesNode) startExec(params runParams) error {
 	}
 
 	// Build the query to find matching provisioned users.
-	query, queryArgs := n.buildFilterQuery()
+	query, queryArgs, err := n.buildFilterQuery()
+	if err != nil {
+		return err
+	}
 
 	rows, err := params.p.InternalSQLTxn().QueryBufferedEx(
 		params.ctx,
@@ -174,7 +188,7 @@ func (n *DropProvisionedRolesNode) startExec(params runParams) error {
 
 // buildFilterQuery constructs the SQL query to find provisioned users
 // matching the filter options.
-func (n *DropProvisionedRolesNode) buildFilterQuery() (string, []interface{}) {
+func (n *DropProvisionedRolesNode) buildFilterQuery() (string, []interface{}, error) {
 	var whereExprs []string
 	var args []interface{}
 	argIdx := 1
@@ -194,7 +208,7 @@ func (n *DropProvisionedRolesNode) buildFilterQuery() (string, []interface{}) {
 
 	if n.options != nil && n.options.LastLoginBefore != nil {
 		whereExprs = append(whereExprs, fmt.Sprintf(
-			"u.estimated_last_login_time < ($%d)::TIMESTAMPTZ", argIdx,
+			"(u.estimated_last_login_time IS NULL OR u.estimated_last_login_time < ($%d)::TIMESTAMPTZ)", argIdx,
 		))
 		args = append(args, tree.AsStringWithFlags(n.options.LastLoginBefore, tree.FmtBareStrings))
 		argIdx++
@@ -204,8 +218,17 @@ func (n *DropProvisionedRolesNode) buildFilterQuery() (string, []interface{}) {
 
 	var limitClause string
 	if n.limit != nil && n.limit.Count != nil {
+		// The planner already validated that Count is a *tree.NumVal.
+		// Extract it as int64 so the internal executor receives the
+		// correct type for the LIMIT placeholder.
+		numVal := n.limit.Count.(*tree.NumVal)
+		limitInt, numErr := numVal.AsInt64()
+		if numErr != nil {
+			return "", nil, pgerror.Wrapf(numErr, pgcode.InvalidParameterValue,
+				"LIMIT must be a non-negative integer")
+		}
 		limitClause = fmt.Sprintf(" LIMIT $%d", argIdx)
-		args = append(args, tree.AsStringWithFlags(n.limit.Count, tree.FmtBareStrings))
+		args = append(args, limitInt)
 		argIdx++
 	}
 
@@ -215,7 +238,7 @@ func (n *DropProvisionedRolesNode) buildFilterQuery() (string, []interface{}) {
 	)
 
 	_ = argIdx
-	return query, args
+	return query, args, nil
 }
 
 // userHasDependencies checks whether the given user owns any objects,
@@ -281,12 +304,15 @@ func (n *DropProvisionedRolesNode) userHasDependencies(
 		}
 	}
 
-	// Check scheduled jobs.
+	// Check scheduled jobs. Use NodeUserSessionDataOverride because
+	// CREATEROLE users cannot read system.scheduled_jobs directly.
+	// This is safe since the query is hardcoded with only a
+	// parameterized username — no user-controlled SQL expressions.
 	row, err := params.p.InternalSQLTxn().QueryRowEx(
 		params.ctx,
 		"check-user-schedules",
 		params.p.txn,
-		sessiondata.InternalExecutorOverride{User: params.p.User()},
+		sessiondata.NodeUserSessionDataOverride,
 		"SELECT count(*) FROM system.scheduled_jobs WHERE owner=$1",
 		normalizedUsername,
 	)
@@ -297,12 +323,13 @@ func (n *DropProvisionedRolesNode) userHasDependencies(
 		return true, nil
 	}
 
-	// Check system privileges.
+	// Check system privileges. Same as above — use node privileges
+	// for the hardcoded parameterized query.
 	row, err = params.p.InternalSQLTxn().QueryRowEx(
 		params.ctx,
 		"check-user-system-privileges",
 		params.p.txn,
-		sessiondata.InternalExecutorOverride{User: params.p.User()},
+		sessiondata.NodeUserSessionDataOverride,
 		"SELECT count(*) FROM system.privileges WHERE username=$1",
 		normalizedUsername.Normalized(),
 	)
